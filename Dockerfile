@@ -4,6 +4,6 @@ WORKDIR /app
 
 COPY server.py .
 
-RUN pip install flask
+RUN pip install flask ctrader-open-api requests
 
 CMD ["python", "server.py"]
