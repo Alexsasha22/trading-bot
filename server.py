@@ -15,6 +15,8 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAAccountAuthRes,
     ProtoOASymbolsListReq,
     ProtoOASymbolsListRes,
+    ProtoOATraderReq,
+    ProtoOATraderRes,
     ProtoOANewOrderReq,
     ProtoOAExecutionEvent,
     ProtoOAOrderErrorEvent,
@@ -23,59 +25,36 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
 
 from twisted.internet import reactor
 
-
 app = Flask(__name__)
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
 CLIENT_ID = os.getenv("CTRADER_CLIENT_ID")
 CLIENT_SECRET = os.getenv("CTRADER_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("CTRADER_REDIRECT_URI")
-
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
+CTRADER_ENV = os.getenv("CTRADER_ENV", "LIVE").upper()
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
+RISK_PERCENT = 1.0
+SL_POINTS = 10
+TP_POINTS = 10
 
 access_token = None
 refresh_token = None
 
 ctrader_client = None
-
 ctrader_connected = False
 application_authenticated = False
 account_authenticated = False
-
 account_id = None
 
+account_balance = None
 symbols = {}
+eurusd_symbol = None
 
 pending_orders = {}
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
 def normalize_symbol(symbol):
-    """
-    Converts symbols such as:
-
-    EURUSD
-    EUR/USD
-    EURUSD.
-    EUR/USD
-
-    into:
-
-    EURUSD
-    """
-
     if not symbol:
         return ""
 
@@ -91,228 +70,150 @@ def normalize_symbol(symbol):
 
 
 def find_symbol_id(symbol_name):
-    """
-    Find the cTrader symbol ID.
-    """
-
     wanted = normalize_symbol(symbol_name)
 
     if wanted in symbols:
         return symbols[wanted]
 
     for name, symbol_id in symbols.items():
-
-        if (
-            wanted in name
-            or name in wanted
-        ):
+        if wanted in name or name in wanted:
             return symbol_id
 
     return None
 
 
 def send_from_reactor(function, *args):
-    """
-    Safely execute a function inside Twisted's reactor thread.
-    """
-
     if reactor.running:
-        reactor.callFromThread(
-            function,
-            *args
-        )
+        reactor.callFromThread(function, *args)
     else:
         print("Twisted reactor is not running")
 
 
-# ============================================================
-# CTRADER CONNECTION
-# ============================================================
-
 def start_ctrader():
-
     global ctrader_client
 
     if ctrader_client is not None:
         return
 
-    print("Starting cTrader DEMO connection...")
+    if CTRADER_ENV == "LIVE":
+        host = EndPoints.PROTOBUF_LIVE_HOST
+        print("Starting cTrader LIVE connection...")
+    else:
+        host = EndPoints.PROTOBUF_DEMO_HOST
+        print("Starting cTrader DEMO connection...")
 
     ctrader_client = Client(
-        EndPoints.PROTOBUF_DEMO_HOST,
+        host,
         EndPoints.PROTOBUF_PORT,
         TcpProtocol
     )
 
-    ctrader_client.setConnectedCallback(
-        on_ctrader_connected
-    )
-
-    ctrader_client.setDisconnectedCallback(
-        on_ctrader_disconnected
-    )
-
-    ctrader_client.setMessageReceivedCallback(
-        on_ctrader_message
-    )
+    ctrader_client.setConnectedCallback(on_ctrader_connected)
+    ctrader_client.setDisconnectedCallback(on_ctrader_disconnected)
+    ctrader_client.setMessageReceivedCallback(on_ctrader_message)
 
     ctrader_client.startService()
 
     threading.Thread(
         target=reactor.run,
-        kwargs={
-            "installSignalHandlers": False
-        },
+        kwargs={"installSignalHandlers": False},
         daemon=True
     ).start()
 
 
 def on_ctrader_connected(client):
-
     global ctrader_connected
 
     ctrader_connected = True
 
-    print("cTrader DEMO connected")
+    print("cTrader connected:", CTRADER_ENV)
 
     auth_request = ProtoOAApplicationAuthReq()
-
     auth_request.clientId = CLIENT_ID
     auth_request.clientSecret = CLIENT_SECRET
 
-    deferred = client.send(
-        auth_request
-    )
-
-    deferred.addErrback(
-        on_ctrader_error
-    )
+    deferred = client.send(auth_request)
+    deferred.addErrback(on_ctrader_error)
 
 
-def on_ctrader_disconnected(
-    client,
-    reason
-):
-
+def on_ctrader_disconnected(client, reason):
     global ctrader_connected
 
     ctrader_connected = False
 
-    print(
-        "cTrader disconnected:",
-        reason
-    )
+    print("cTrader disconnected:", reason)
 
 
 def on_ctrader_error(failure):
-
-    print(
-        "cTrader error:",
-        failure
-    )
+    print("cTrader error:", failure)
 
 
-# ============================================================
-# CTRADER MESSAGE HANDLER
-# ============================================================
-
-def on_ctrader_message(
-    client,
-    message
-):
-
+def on_ctrader_message(client, message):
     global application_authenticated
     global account_authenticated
     global account_id
     global symbols
+    global eurusd_symbol
+    global account_balance
 
     try:
+        payload = Protobuf.extract(message)
 
-        payload = Protobuf.extract(
-            message
-        )
-
-        # ----------------------------------------------------
-        # APPLICATION AUTH
-        # ----------------------------------------------------
-
-        if isinstance(
-            payload,
-            ProtoOAApplicationAuthRes
-        ):
+        if isinstance(payload, ProtoOAApplicationAuthRes):
 
             application_authenticated = True
 
-            print(
-                "cTrader application authenticated"
-            )
+            print("cTrader application authenticated")
 
             if access_token is None:
-
-                print(
-                    "Waiting for OAuth access token..."
-                )
-
+                print("Waiting for OAuth access token...")
                 return
 
-            request = (
-                ProtoOAGetAccountListByAccessTokenReq()
-            )
-
+            request = ProtoOAGetAccountListByAccessTokenReq()
             request.accessToken = access_token
 
-            client.send(
-                request
-            ).addErrback(
-                on_ctrader_error
-            )
+            client.send(request).addErrback(on_ctrader_error)
 
             return
 
-        # ----------------------------------------------------
-        # ACCOUNT LIST
-        # ----------------------------------------------------
-
-        if isinstance(
-            payload,
-            ProtoOAGetAccountListByAccessTokenRes
-        ):
+        if isinstance(payload, ProtoOAGetAccountListByAccessTokenRes):
 
             accounts = payload.ctidTraderAccount
 
             if not accounts:
-
-                print(
-                    "No cTrader accounts found"
-                )
-
+                print("No cTrader accounts found")
                 return
 
             selected_account = None
 
-            # Prefer DEMO
+            wanted_live = CTRADER_ENV == "LIVE"
+
             for account in accounts:
 
-                if not getattr(
-                    account,
-                    "isLive",
-                    True
-                ):
+                is_live = bool(getattr(account, "isLive", False))
 
+                if is_live == wanted_live:
                     selected_account = account
                     break
 
             if selected_account is None:
 
-                selected_account = accounts[0]
+                print(
+                    "No account matching environment:",
+                    CTRADER_ENV
+                )
+
+                return
 
             account_id = int(
                 selected_account.ctidTraderAccountId
             )
 
             print(
-                "cTrader account found:",
-                account_id
+                "Selected cTrader account:",
+                account_id,
+                "LIVE=",
+                bool(getattr(selected_account, "isLive", False))
             )
 
             request = ProtoOAAccountAuthReq()
@@ -320,59 +221,61 @@ def on_ctrader_message(
             request.ctidTraderAccountId = account_id
             request.accessToken = access_token
 
-            client.send(
-                request
-            ).addErrback(
-                on_ctrader_error
-            )
+            client.send(request).addErrback(on_ctrader_error)
 
             return
 
-        # ----------------------------------------------------
-        # ACCOUNT AUTH
-        # ----------------------------------------------------
-
-        if isinstance(
-            payload,
-            ProtoOAAccountAuthRes
-        ):
+        if isinstance(payload, ProtoOAAccountAuthRes):
 
             account_authenticated = True
-
-            account_id = int(
-                payload.ctidTraderAccountId
-            )
+            account_id = int(payload.ctidTraderAccountId)
 
             print(
                 "cTrader account authenticated:",
                 account_id
             )
 
-            print(
-                "Loading cTrader symbols..."
+            print("Loading account information...")
+
+            request = ProtoOATraderReq()
+            request.ctidTraderAccountId = account_id
+
+            client.send(request).addErrback(on_ctrader_error)
+
+            print("Loading cTrader symbols...")
+
+            symbol_request = ProtoOASymbolsListReq()
+
+            symbol_request.ctidTraderAccountId = account_id
+            symbol_request.includeArchivedSymbols = False
+
+            client.send(symbol_request).addErrback(on_ctrader_error)
+
+            return
+
+        if isinstance(payload, ProtoOATraderRes):
+
+            trader = payload.trader
+
+            money_digits = int(
+                getattr(trader, "moneyDigits", 2)
             )
 
-            request = ProtoOASymbolsListReq()
+            account_balance = (
+                float(trader.balance)
+                / (10 ** money_digits)
+            )
 
-            request.ctidTraderAccountId = account_id
-            request.includeArchivedSymbols = False
-
-            client.send(
-                request
-            ).addErrback(
-                on_ctrader_error
+            print(
+                "Account balance:",
+                account_balance,
+                "moneyDigits:",
+                money_digits
             )
 
             return
 
-        # ----------------------------------------------------
-        # SYMBOL LIST
-        # ----------------------------------------------------
-
-        if isinstance(
-            payload,
-            ProtoOASymbolsListRes
-        ):
+        if isinstance(payload, ProtoOASymbolsListRes):
 
             symbols = {}
 
@@ -384,24 +287,29 @@ def on_ctrader_message(
 
                 if name:
 
-                    symbols[name] = int(
-                        symbol.symbolId
-                    )
+                    symbols[name] = {
+                        "id": int(symbol.symbolId),
+                        "min_volume": int(
+                            getattr(symbol, "minVolume", 0)
+                        ),
+                        "max_volume": int(
+                            getattr(symbol, "maxVolume", 0)
+                        ),
+                        "step_volume": int(
+                            getattr(symbol, "stepVolume", 0)
+                        ),
+                        "digits": int(
+                            getattr(symbol, "digits", 5)
+                        )
+                    }
 
-            print(
-                "cTrader symbols loaded:",
-                len(symbols)
-            )
+            eurusd_symbol = symbols.get("EURUSD")
 
-            eurusd_id = find_symbol_id(
-                "EURUSD"
-            )
-
-            if eurusd_id:
+            if eurusd_symbol:
 
                 print(
-                    "EURUSD symbol ID:",
-                    eurusd_id
+                    "EURUSD symbol loaded:",
+                    eurusd_symbol
                 )
 
             else:
@@ -411,34 +319,20 @@ def on_ctrader_message(
                 )
 
             print(
-                "cTrader DEMO is READY"
+                "cTrader",
+                CTRADER_ENV,
+                "is READY"
             )
 
             return
 
-        # ----------------------------------------------------
-        # EXECUTION EVENT
-        # ----------------------------------------------------
+        if isinstance(payload, ProtoOAExecutionEvent):
 
-        if isinstance(
-            payload,
-            ProtoOAExecutionEvent
-        ):
-
-            handle_execution_event(
-                payload
-            )
+            handle_execution_event(payload)
 
             return
 
-        # ----------------------------------------------------
-        # ORDER ERROR
-        # ----------------------------------------------------
-
-        if isinstance(
-            payload,
-            ProtoOAOrderErrorEvent
-        ):
+        if isinstance(payload, ProtoOAOrderErrorEvent):
 
             print(
                 "ORDER ERROR:",
@@ -450,11 +344,7 @@ def on_ctrader_message(
                 )
             )
 
-            if getattr(
-                payload,
-                "orderId",
-                0
-            ):
+            if getattr(payload, "orderId", 0):
 
                 pending_orders.pop(
                     int(payload.orderId),
@@ -463,14 +353,7 @@ def on_ctrader_message(
 
             return
 
-        # ----------------------------------------------------
-        # OTHER MESSAGE
-        # ----------------------------------------------------
-
-        print(
-            "cTrader message:",
-            payload
-        )
+        print("cTrader message:", payload)
 
     except Exception as error:
 
@@ -480,13 +363,88 @@ def on_ctrader_message(
         )
 
 
-# ============================================================
-# EXECUTION HANDLING
-# ============================================================
+def calculate_volume(entry):
 
-def handle_execution_event(
-    event
-):
+    if account_balance is None:
+        print("Cannot calculate volume: balance unavailable")
+        return None
+
+    if entry <= 0:
+        print("Invalid entry:", entry)
+        return None
+
+    risk_money = (
+        account_balance
+        * RISK_PERCENT
+        / 100.0
+    )
+
+    # EURUSD:
+    # 10 points = 0.00010
+    distance = SL_POINTS * 0.00001
+
+    # Account currency = EUR
+    # EURUSD quote = USD
+    # Loss per EUR unit in EUR = distance / entry
+    #
+    # volume = risk / (distance / entry)
+
+    volume_units = (
+        risk_money
+        * entry
+        / distance
+    )
+
+    print(
+        "Risk calculation:",
+        "balance=", account_balance,
+        "risk=", risk_money,
+        "entry=", entry,
+        "SL distance=", distance,
+        "volume=", volume_units
+    )
+
+    if eurusd_symbol is None:
+        return volume_units
+
+    min_volume = eurusd_symbol["min_volume"]
+    max_volume = eurusd_symbol["max_volume"]
+    step_volume = eurusd_symbol["step_volume"]
+
+    # cTrader volume values are in 0.01 units.
+    # Convert to protocol volume.
+
+    protocol_volume = volume_units * 100
+
+    if min_volume > 0:
+        protocol_volume = max(
+            protocol_volume,
+            min_volume
+        )
+
+    if max_volume > 0:
+        protocol_volume = min(
+            protocol_volume,
+            max_volume
+        )
+
+    if step_volume > 0:
+        protocol_volume = (
+            int(protocol_volume / step_volume)
+            * step_volume
+        )
+
+    final_volume = protocol_volume / 100.0
+
+    print(
+        "Final volume:",
+        final_volume
+    )
+
+    return final_volume
+
+
+def handle_execution_event(event):
 
     try:
 
@@ -500,30 +458,18 @@ def handle_execution_event(
         )
 
         order = None
-
-        if event.HasField(
-            "order"
-        ):
-
-            order = event.order
-
         position = None
 
-        if event.HasField(
-            "position"
-        ):
+        if event.HasField("order"):
+            order = event.order
 
+        if event.HasField("position"):
             position = event.position
 
-        # ----------------------------------------------------
-        # ORDER ACCEPTED
-        # ----------------------------------------------------
-
+        # Accepted
         if execution_type == 2:
 
-            print(
-                "Order accepted by cTrader"
-            )
+            print("Order accepted by cTrader")
 
             if order is not None:
 
@@ -540,45 +486,17 @@ def handle_execution_event(
 
             return
 
-        # ----------------------------------------------------
-        # ORDER FILLED
-        # ----------------------------------------------------
+        # Filled / partial fill
+        if execution_type in (3, 11):
 
-        if execution_type in (
-            3,
-            11
-        ):
-
-            print(
-                "Order FILLED"
-            )
+            print("Order FILLED")
 
             if order is not None:
-
                 order_id = int(
                     order.orderId
                 )
-
             else:
-
                 order_id = None
-
-            if (
-                position is None
-                and order_id is not None
-            ):
-
-                pending = pending_orders.get(
-                    order_id
-                )
-
-                if pending:
-
-                    print(
-                        "Position not included yet."
-                    )
-
-                return
 
             if position is None:
 
@@ -612,15 +530,12 @@ def handle_execution_event(
             apply_protection(
                 position_id,
                 pending.get("sl"),
-                pending.get("tp1")
+                pending.get("tp")
             )
 
             return
 
-        # ----------------------------------------------------
-        # REJECTED
-        # ----------------------------------------------------
-
+        # Rejected
         if execution_type == 7:
 
             print(
@@ -644,10 +559,6 @@ def handle_execution_event(
         )
 
 
-# ============================================================
-# APPLY STOP LOSS / TAKE PROFIT
-# ============================================================
-
 def apply_protection(
     position_id,
     stop_loss,
@@ -663,20 +574,10 @@ def apply_protection(
 
         return
 
-    if stop_loss is None and take_profit is None:
-
-        print(
-            "No SL/TP provided."
-        )
-
-        return
-
     request = ProtoOAAmendPositionSLTPReq()
 
     request.ctidTraderAccountId = account_id
-    request.positionId = int(
-        position_id
-    )
+    request.positionId = int(position_id)
 
     if stop_loss is not None:
 
@@ -710,9 +611,7 @@ def apply_protection(
     )
 
 
-def on_protection_success(
-    result
-):
+def on_protection_success(result):
 
     print(
         "SL/TP successfully applied"
@@ -721,16 +620,10 @@ def on_protection_success(
     return result
 
 
-# ============================================================
-# SEND MARKET ORDER
-# ============================================================
-
 def send_market_order(
     action,
     symbol,
-    volume,
-    sl,
-    tp1
+    entry
 ):
 
     if not ctrader_connected:
@@ -759,11 +652,11 @@ def send_market_order(
 
         return
 
-    symbol_id = find_symbol_id(
-        symbol
+    symbol_data = symbols.get(
+        normalize_symbol(symbol)
     )
 
-    if symbol_id is None:
+    if symbol_data is None:
 
         print(
             "Symbol not found:",
@@ -772,195 +665,162 @@ def send_market_order(
 
         return
 
-    try:
+    volume = calculate_volume(
+        float(entry)
+    )
 
-        # ----------------------------------------------------
-        # Volume
-        #
-        # TradingView sends volume in units.
-        #
-        # cTrader protocol uses 0.01 unit.
-        #
-        # Example:
-        # volume = 10 units
-        # protocol volume = 1000
-        # ----------------------------------------------------
+    if volume is None or volume <= 0:
 
-        volume_units = float(
+        print(
+            "Invalid calculated volume:",
             volume
         )
 
-        if volume_units <= 0:
+        return
+
+    distance = SL_POINTS * 0.00001
+
+    if action == "BUY":
+
+        trade_side = 1
+
+        sl = float(entry) - distance
+        tp = float(entry) + (
+            TP_POINTS * 0.00001
+        )
+
+    else:
+
+        trade_side = 2
+
+        sl = float(entry) + distance
+        tp = float(entry) - (
+            TP_POINTS * 0.00001
+        )
+
+    protocol_volume = int(
+        round(volume * 100)
+    )
+
+    order = ProtoOANewOrderReq()
+
+    order.ctidTraderAccountId = int(
+        account_id
+    )
+
+    order.symbolId = int(
+        symbol_data["id"]
+    )
+
+    order.orderType = 1
+    order.tradeSide = trade_side
+    order.volume = protocol_volume
+
+    print(
+        "Sending",
+        CTRADER_ENV,
+        "order:",
+        action,
+        symbol,
+        "volume=",
+        volume,
+        "entry=",
+        entry,
+        "SL=",
+        sl,
+        "TP=",
+        tp
+    )
+
+    deferred = ctrader_client.send(
+        order
+    )
+
+    def order_response(result):
+
+        try:
+
+            payload = result
+
+            if not isinstance(
+                payload,
+                ProtoOAExecutionEvent
+            ):
+
+                print(
+                    "Unexpected order response:",
+                    payload
+                )
+
+                return result
+
+            if not payload.HasField(
+                "order"
+            ):
+
+                print(
+                    "Execution response "
+                    "without order"
+                )
+
+                return result
+
+            order_id = int(
+                payload.order.orderId
+            )
+
+            pending_orders[order_id] = {
+
+                "sl": sl,
+                "tp": tp,
+
+                "symbol": symbol,
+                "action": action
+            }
 
             print(
-                "Invalid volume:",
-                volume
+                "Order registered:",
+                order_id
             )
 
-            return
+            if (
+                payload.HasField("position")
+                and int(
+                    payload.executionType
+                ) in (3, 11)
+            ):
 
-        protocol_volume = int(
-            round(
-                volume_units * 100
+                position_id = int(
+                    payload.position.positionId
+                )
+
+                pending_orders.pop(
+                    order_id,
+                    None
+                )
+
+                apply_protection(
+                    position_id,
+                    sl,
+                    tp
+                )
+
+            return result
+
+        except Exception as error:
+
+            print(
+                "Order response error:",
+                error
             )
-        )
 
-        # ----------------------------------------------------
-        # SIDE
-        #
-        # BUY = 1
-        # SELL = 2
-        # ----------------------------------------------------
+            return result
 
-        if action == "BUY":
+    deferred.addCallbacks(
+        order_response,
+        on_ctrader_error
+    )
 
-            trade_side = 1
-
-        else:
-
-            trade_side = 2
-
-        # ----------------------------------------------------
-        # MARKET ORDER
-        # ----------------------------------------------------
-
-        order = ProtoOANewOrderReq()
-
-        order.ctidTraderAccountId = int(
-            account_id
-        )
-
-        order.symbolId = int(
-            symbol_id
-        )
-
-        order.orderType = 1
-
-        order.tradeSide = trade_side
-
-        order.volume = protocol_volume
-
-        print(
-            "Sending DEMO order:",
-            action,
-            symbol,
-            "volume=",
-            volume_units
-        )
-
-        deferred = ctrader_client.send(
-            order
-        )
-
-        def order_response(result):
-
-            try:
-
-                payload = result
-
-                if not isinstance(
-                    payload,
-                    ProtoOAExecutionEvent
-                ):
-
-                    print(
-                        "Unexpected order response:",
-                        payload
-                    )
-
-                    return result
-
-                if not payload.HasField(
-                    "order"
-                ):
-
-                    print(
-                        "Execution response "
-                        "without order"
-                    )
-
-                    return result
-
-                order_id = int(
-                    payload.order.orderId
-                )
-
-                pending_orders[
-                    order_id
-                ] = {
-
-                    "sl": sl,
-
-                    "tp1": tp1,
-
-                    "symbol": symbol,
-
-                    "action": action
-
-                }
-
-                print(
-                    "Order registered:",
-                    order_id
-                )
-
-                # Sometimes the market order
-                # is already filled in this event.
-
-                if (
-                    payload.HasField(
-                        "position"
-                    )
-                    and int(
-                        payload.executionType
-                    ) in (
-                        3,
-                        11
-                    )
-                ):
-
-                    position_id = int(
-                        payload.position.positionId
-                    )
-
-                    pending_orders.pop(
-                        order_id,
-                        None
-                    )
-
-                    apply_protection(
-                        position_id,
-                        sl,
-                        tp1
-                    )
-
-                return result
-
-            except Exception as error:
-
-                print(
-                    "Order response error:",
-                    error
-                )
-
-                return result
-
-        deferred.addCallbacks(
-            order_response,
-            on_ctrader_error
-        )
-
-    except Exception as error:
-
-        print(
-            "Could not send market order:",
-            error
-        )
-
-
-# ============================================================
-# HOME
-# ============================================================
 
 @app.get("/")
 def home():
@@ -971,17 +831,15 @@ def home():
     )
 
 
-# ============================================================
-# HEALTH
-# ============================================================
-
 @app.get("/health")
 def health():
 
     return jsonify({
 
-        "status":
-            "OK",
+        "status": "OK",
+
+        "ctrader_environment":
+            CTRADER_ENV,
 
         "ctrader_configured":
             bool(
@@ -1005,17 +863,23 @@ def health():
         "account_id":
             account_id,
 
+        "account_balance":
+            account_balance,
+
         "eurusd_symbol_loaded":
-            find_symbol_id(
-                "EURUSD"
-            ) is not None
+            "EURUSD" in symbols,
+
+        "risk_percent":
+            RISK_PERCENT,
+
+        "sl_points":
+            SL_POINTS,
+
+        "tp_points":
+            TP_POINTS
 
     }), 200
 
-
-# ============================================================
-# OAUTH AUTH
-# ============================================================
 
 @app.get("/auth")
 def auth():
@@ -1023,29 +887,21 @@ def auth():
     if not CLIENT_ID or not REDIRECT_URI:
 
         return jsonify({
-
             "error":
                 "cTrader OAuth variables missing"
-
         }), 500
 
     url = (
-        "https://id.ctrader.com/my/settings/openapi/"
-        "grantingaccess/"
+        "https://id.ctrader.com/my/settings/"
+        "openapi/grantingaccess/"
         f"?client_id={CLIENT_ID}"
         f"&redirect_uri={REDIRECT_URI}"
         "&scope=trading"
         "&product=web"
     )
 
-    return redirect(
-        url
-    )
+    return redirect(url)
 
-
-# ============================================================
-# OAUTH CALLBACK
-# ============================================================
 
 @app.get("/callback")
 def callback():
@@ -1053,14 +909,11 @@ def callback():
     global access_token
     global refresh_token
 
-    code = request.args.get(
-        "code"
-    )
+    code = request.args.get("code")
 
     if not code:
 
         return jsonify({
-
             "error":
                 "No authorization code received",
 
@@ -1113,9 +966,7 @@ def callback():
 
     if (
         response.status_code != 200
-        or not data.get(
-            "accessToken"
-        )
+        or not data.get("accessToken")
     ):
 
         return jsonify({
@@ -1128,9 +979,7 @@ def callback():
 
         }), 400
 
-    access_token = data[
-        "accessToken"
-    ]
+    access_token = data["accessToken"]
 
     refresh_token = data.get(
         "refreshToken"
@@ -1150,22 +999,17 @@ def callback():
         "token_received":
             True,
 
+        "environment":
+            CTRADER_ENV,
+
         "message":
-            "Connecting to cTrader DEMO..."
+            "Connecting to cTrader..."
 
     }), 200
 
 
-# ============================================================
-# WEBHOOK
-# ============================================================
-
 @app.post("/webhook")
 def webhook():
-
-    # --------------------------------------------------------
-    # SECRET
-    # --------------------------------------------------------
 
     if WEBHOOK_SECRET:
 
@@ -1176,15 +1020,9 @@ def webhook():
         if secret != WEBHOOK_SECRET:
 
             return jsonify({
-
                 "error":
                     "Unauthorized"
-
             }), 401
-
-    # --------------------------------------------------------
-    # JSON
-    # --------------------------------------------------------
 
     data = request.get_json(
         silent=True
@@ -1193,21 +1031,12 @@ def webhook():
     if not data:
 
         return jsonify({
-
             "error":
                 "Invalid JSON"
-
         }), 400
 
-    # --------------------------------------------------------
-    # ACTION
-    # --------------------------------------------------------
-
     action = str(
-        data.get(
-            "action",
-            ""
-        )
+        data.get("action", "")
     ).upper()
 
     if action not in (
@@ -1216,53 +1045,36 @@ def webhook():
     ):
 
         return jsonify({
-
             "error":
                 "Invalid action"
-
         }), 400
-
-    # --------------------------------------------------------
-    # SYMBOL
-    # --------------------------------------------------------
 
     symbol = data.get(
         "symbol",
         "EURUSD"
     )
 
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
-
-    volume = data.get(
-        "volume"
+    entry = data.get(
+        "entry"
     )
 
-    if volume is None:
+    if entry is None:
 
         return jsonify({
-
             "error":
-                "Missing volume"
-
+                "Missing entry"
         }), 400
 
-    # --------------------------------------------------------
-    # PROTECTION
-    # --------------------------------------------------------
+    try:
 
-    sl = data.get(
-        "sl"
-    )
+        entry = float(entry)
 
-    tp1 = data.get(
-        "tp1"
-    )
+    except Exception:
 
-    # --------------------------------------------------------
-    # CHECK CTRADER
-    # --------------------------------------------------------
+        return jsonify({
+            "error":
+                "Invalid entry"
+        }), 400
 
     if not account_authenticated:
 
@@ -1272,20 +1084,15 @@ def webhook():
                 "received",
 
             "error":
-                "cTrader DEMO account is not authenticated",
+                "cTrader account "
+                "not authenticated",
 
             "ctrader_authenticated":
                 False
 
         }), 503
 
-    # --------------------------------------------------------
-    # CHECK SYMBOL
-    # --------------------------------------------------------
-
-    if find_symbol_id(
-        symbol
-    ) is None:
+    if find_symbol_id(symbol) is None:
 
         return jsonify({
 
@@ -1300,24 +1107,18 @@ def webhook():
 
         }), 503
 
-    # --------------------------------------------------------
-    # SEND ORDER
-    # --------------------------------------------------------
-
     send_from_reactor(
         send_market_order,
         action,
         symbol,
-        volume,
-        sl,
-        tp1
+        entry
     )
 
     print(
         "Webhook signal received:",
         action,
         symbol,
-        volume
+        entry
     )
 
     return jsonify({
@@ -1331,24 +1132,26 @@ def webhook():
         "symbol":
             symbol,
 
-        "volume":
-            volume,
+        "entry":
+            entry,
 
-        "sl":
-            sl,
+        "risk_percent":
+            RISK_PERCENT,
 
-        "tp1":
-            tp1,
+        "sl_points":
+            SL_POINTS,
+
+        "tp_points":
+            TP_POINTS,
+
+        "ctrader_environment":
+            CTRADER_ENV,
 
         "ctrader_authenticated":
             account_authenticated
 
     }), 200
 
-
-# ============================================================
-# START SERVER
-# ============================================================
 
 if __name__ == "__main__":
 
